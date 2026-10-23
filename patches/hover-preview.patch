@@ -1,0 +1,524 @@
+diff --git a/cosmic-app-list/cosmic-app-list-config/src/lib.rs b/cosmic-app-list/cosmic-app-list-config/src/lib.rs
+index 30fb0b14..5ed3cc5e 100644
+--- a/cosmic-app-list/cosmic-app-list-config/src/lib.rs
++++ b/cosmic-app-list/cosmic-app-list-config/src/lib.rs
+@@ -21,6 +21,9 @@ pub struct AppListConfig {
+     pub filter_top_levels: Option<ToplevelFilter>,
+     pub favorites: Vec<String>,
+     pub enable_drag_source: bool,
++    /// Open an app's window-preview popup when its icon is hovered (after `hover_preview_delay_ms`).
++    pub hover_preview: bool,
++    pub hover_preview_delay_ms: u64,
+ }
+ 
+ impl Default for AppListConfig {
+@@ -29,6 +32,8 @@ impl Default for AppListConfig {
+             filter_top_levels: None,
+             favorites: Vec::new(),
+             enable_drag_source: true,
++            hover_preview: false,
++            hover_preview_delay_ms: 350,
+         }
+     }
+ }
+diff --git a/cosmic-app-list/src/app.rs b/cosmic-app-list/src/app.rs
+index 8db96ee3..093a0dc9 100755
+--- a/cosmic-app-list/src/app.rs
++++ b/cosmic-app-list/src/app.rs
+@@ -308,6 +308,8 @@ impl DockItem {
+                 launch_on_preferred_gpu(desktop_info, gpus)
+                     .unwrap_or(Message::Popup(*id, window_id))
+             })
++            .on_enter(Message::HoverEnter(*id, window_id))
++            .on_exit(Message::HoverExit(*id))
+             .into()
+         } else {
+             icon_button.into()
+@@ -359,6 +361,21 @@ pub struct Popup {
+ struct CosmicAppList {
+     core: cosmic::app::Core,
+     popup: Option<Popup>,
++    /// (dock item id, token) of the icon currently hovered, for the hover-preview timer.
++    hover: Option<(u32, u64)>,
++    hover_ctr: u64,
++    hover_open_request: bool,
++    hover_popup: bool,
++    close_token: u64,
++    hover_retry: u8,
++    /// Pending "did the pointer really leave?" check: (dock item id, token).
++    hover_exit: Option<(u32, u64)>,
++    /// When the last preview popup was destroyed; opening a new one too soon after it fails silently.
++    last_popup_close: Option<std::time::Instant>,
++    /// Last dock item the pointer was hit-tested onto (to dispatch each enter once).
++    last_hit: Option<u32>,
++    /// Pointer is inside the hover preview popup (tracked from raw motion, not widget enter/exit).
++    pointer_in_popup: bool,
+     subscription_ctr: u32,
+     item_ctr: u32,
+     desktop_entries: Vec<DesktopEntry>,
+@@ -385,6 +402,8 @@ struct CosmicAppList {
+ pub enum PopupType {
+     RightClickMenu,
+     ToplevelList,
++    /// Hover bubble with the app name, for icons with no windows (hover_preview mode).
++    HoverName,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -396,6 +415,15 @@ enum Message {
+     Pressed(window::Id),
+     ToplevelListPopup(u32, window::Id),
+     ToplevelHoverChanged(ExtForeignToplevelHandleV1, bool),
++    HoverEnter(u32, window::Id),
++    HoverExit(u32),
++    HoverTimeout(u32, window::Id, u64),
++    HoverPopupEnter,
++    HoverPopupExit,
++    HoverCloseCheck(u64),
++    HoverExitCheck(u32, u64),
++    CursorMoved(window::Id, iced::Point),
++    CursorLeft(window::Id),
+     GpuRequest(Option<Vec<Gpu>>),
+     CloseRequested(window::Id),
+     ClosePopup,
+@@ -644,6 +672,29 @@ fn find_desktop_entries<'a>(
+ 
+ impl CosmicAppList {
+     // Cache all desktop entries to use when new apps are added to the dock.
++    /// With hover previews on, open apps get no tooltip (the preview shows the titles);
++    /// everything else keeps the normal applet tooltip.
++    fn maybe_tooltip<'a>(
++        &self,
++        _dock_item: &DockItem,
++        icon: impl Into<Element<'a, Message>>,
++        name: String,
++        has_popup: bool,
++        parent: Option<window::Id>,
++    ) -> Element<'a, Message> {
++        // With hover previews on, no tooltips at all: a tooltip is a popup too, and it would
++        // collide with a preview opening right after it.
++        let tooltip = !self.config.hover_preview;
++        if !tooltip {
++            icon.into()
++        } else {
++            self.core
++                .applet
++                .applet_tooltip(icon, name, has_popup, Message::Surface, parent)
++                .into()
++        }
++    }
++
+     fn update_desktop_entries(&mut self) {
+         self.desktop_entries = fde::Iter::new(fde::default_paths())
+             .filter_map(|p| fde::DesktopEntry::from_path(p, Some(&self.locales)).ok())
+@@ -959,7 +1010,209 @@ impl cosmic::Application for CosmicAppList {
+                     return Task::batch([gpu_update, popup_task]);
+                 }
+             }
++            Message::CursorMoved(window_id, position) => {
++                if !self.config.hover_preview {
++                    return Task::none();
++                }
++                if self.hover_popup && self.popup.as_ref().is_some_and(|p| p.id == window_id) {
++                    // Inside the preview: cancel any pending close.
++                    self.pointer_in_popup = true;
++                    self.close_token = self.close_token.wrapping_add(1);
++                    return Task::none();
++                }
++                // Hover enter/exit on the icons is unreliable while a popup exists, so hit-test
++                // the pointer against the icon rectangles ourselves.
++                if Some(window_id) != self.core.main_window_id() {
++                    return Task::none();
++                }
++                self.pointer_in_popup = false;
++                let hit = self.rectangles.iter().find_map(|(k, r)| match k {
++                    DockItemId::Item(item) if r.contains(position) => Some(*item),
++                    _ => None,
++                });
++                if hit != self.last_hit {
++                    self.last_hit = hit;
++                    if let Some(item) = hit {
++                        let already = matches!(self.hover, Some((h, _)) if h == item)
++                            || self.popup.as_ref().is_some_and(|p| p.dock_item.id == item && self.hover_popup);
++                        if !already {
++                            return self.update(Message::HoverEnter(item, window_id));
++                        }
++                    }
++                }
++            }
++            Message::CursorLeft(window_id) => {
++                if self.hover_popup && self.popup.as_ref().is_some_and(|p| p.id == window_id) {
++                    self.pointer_in_popup = false;
++                    self.close_token = self.close_token.wrapping_add(1);
++                    let token = self.close_token;
++                    return iced::Task::perform(
++                        async move { sleep(Duration::from_millis(400)).await },
++                        move |()| Message::HoverCloseCheck(token),
++                    )
++                    .map(cosmic::Action::App);
++                }
++                // Pointer left the dock surface (onto another applet or the desktop).
++                if Some(window_id) == self.core.main_window_id() {
++                    self.last_hit = None;
++                    self.hover = None;
++                    self.hover_exit = None;
++                    if self.hover_popup && self.popup.is_some() {
++                        self.close_token = self.close_token.wrapping_add(1);
++                        let token = self.close_token;
++                        return iced::Task::perform(
++                            async move { sleep(Duration::from_millis(400)).await },
++                            move |()| Message::HoverCloseCheck(token),
++                        )
++                        .map(cosmic::Action::App);
++                    }
++                }
++            }
++            Message::HoverEnter(id, parent_window_id) => {
++                if !self.config.hover_preview {
++                    return Task::none();
++                }
++                self.close_token = self.close_token.wrapping_add(1);
++                if matches!(self.hover_exit, Some((h, _)) if h == id) {
++                    self.hover_exit = None; // the leave was spurious; keep the existing countdown
++                }
++                if matches!(self.hover, Some((h, _)) if h == id) {
++                    return Task::none();
++                }
++                let has_windows = self
++                    .active_list
++                    .iter()
++                    .chain(self.pinned_list.iter())
++                    .find(|t| t.id == id)
++                    .map(|t| !t.toplevels.is_empty())
++                    .unwrap_or(false);
++                if self.popup.as_ref().is_some_and(|p| p.dock_item.id == id) {
++                    return Task::none();
++                }
++                let _ = has_windows;
++                self.hover_retry = 0;
++                self.hover_ctr = self.hover_ctr.wrapping_add(1);
++                let token = self.hover_ctr;
++                self.hover = Some((id, token));
++                let delay = self.config.hover_preview_delay_ms;
++                return iced::Task::perform(
++                    async move { sleep(Duration::from_millis(delay)).await },
++                    move |()| Message::HoverTimeout(id, parent_window_id, token),
++                )
++                .map(cosmic::Action::App);
++            }
++            Message::HoverExit(id) => {
++                // Popups opening/closing make the compositor send leave/enter pairs while the
++                // pointer is still on the icon; only act on a leave that is not followed by an
++                // enter within 150 ms.
++                self.hover_ctr = self.hover_ctr.wrapping_add(1);
++                let token = self.hover_ctr;
++                self.hover_exit = Some((id, token));
++                return iced::Task::perform(
++                    async move { sleep(Duration::from_millis(150)).await },
++                    move |()| Message::HoverExitCheck(id, token),
++                )
++                .map(cosmic::Action::App);
++            }
++            Message::HoverExitCheck(id, token) => {
++                if self.hover_exit != Some((id, token)) {
++                    return Task::none(); // pointer came back
++                }
++                self.hover_exit = None;
++                if matches!(self.hover, Some((h, _)) if h == id) {
++                    self.hover = None;
++                }
++                if self.hover_popup && self.popup.is_some() {
++                    self.close_token = self.close_token.wrapping_add(1);
++                    let token = self.close_token;
++                    return iced::Task::perform(
++                        async move { sleep(Duration::from_millis(400)).await },
++                        move |()| Message::HoverCloseCheck(token),
++                    )
++                    .map(cosmic::Action::App);
++                }
++            }
++            Message::HoverPopupEnter => {
++                self.close_token = self.close_token.wrapping_add(1);
++            }
++            Message::HoverPopupExit => {
++                if self.hover_popup && self.popup.is_some() {
++                    self.close_token = self.close_token.wrapping_add(1);
++                    let token = self.close_token;
++                    return iced::Task::perform(
++                        async move { sleep(Duration::from_millis(400)).await },
++                        move |()| Message::HoverCloseCheck(token),
++                    )
++                    .map(cosmic::Action::App);
++                }
++            }
++            Message::HoverCloseCheck(token) => {
++                if token == self.close_token && self.hover_popup && !self.pointer_in_popup {
++                    if let Some(p) = self.popup.take() {
++                        self.hover_popup = false;
++                        self.last_popup_close = Some(std::time::Instant::now());
++                        return destroy_popup(p.id);
++                    }
++                }
++            }
++            Message::HoverTimeout(id, parent_window_id, token) => {
++                if self.hover != Some((id, token)) {
++                    return Task::none();
++                }
++                self.hover = None;
++                // Switch from another app's preview: close it, then open ours.
++                if let Some(p) = self.popup.take() {
++                    if p.dock_item.id == id {
++                        self.popup = Some(p);
++                        return Task::none();
++                    }
++                    // Close first; re-arm the timer so the new preview opens once the old one is gone.
++                    self.hover_ctr = self.hover_ctr.wrapping_add(1);
++                    let token = self.hover_ctr;
++                    self.hover = Some((id, token));
++                    let reopen = iced::Task::perform(
++                        async move { sleep(Duration::from_millis(200)).await },
++                        move |()| Message::HoverTimeout(id, parent_window_id, token),
++                    )
++                    .map(cosmic::Action::App);
++                    self.last_popup_close = Some(std::time::Instant::now());
++                    return Task::batch([destroy_popup(p.id), reopen]);
++                }
++                if let Some(t) = self.last_popup_close {
++                    let since = t.elapsed();
++                    if since < Duration::from_millis(250) {
++                        let wait = Duration::from_millis(250) - since;
++                        self.hover_ctr = self.hover_ctr.wrapping_add(1);
++                        let token = self.hover_ctr;
++                        self.hover = Some((id, token));
++                        return iced::Task::perform(
++                            async move { sleep(wait).await },
++                            move |()| Message::HoverTimeout(id, parent_window_id, token),
++                        )
++                        .map(cosmic::Action::App);
++                    }
++                }
++                self.hover_open_request = true;
++                self.pointer_in_popup = false;
++                let task = self.update(Message::ToplevelListPopup(id, parent_window_id));
++                if self.popup.is_none() && self.hover_retry < 2 {
++                    // Nothing opened (teardown still in flight or layout not ready): try again shortly.
++                    self.hover_retry += 1;
++                    self.hover_ctr = self.hover_ctr.wrapping_add(1);
++                    let token = self.hover_ctr;
++                    self.hover = Some((id, token));
++                    let retry = iced::Task::perform(
++                        async move { sleep(Duration::from_millis(150)).await },
++                        move |()| Message::HoverTimeout(id, parent_window_id, token),
++                    )
++                    .map(cosmic::Action::App);
++                    return Task::batch([task, retry]);
++                }
++                return task;
++            }
+             Message::ToplevelListPopup(id, parent_window_id) => {
++                let via_hover = std::mem::take(&mut self.hover_open_request);
++                self.hover_popup = via_hover;
+                 if let Some(Popup {
+                     parent,
+                     id: popup_id,
+@@ -996,7 +1249,11 @@ impl cosmic::Application for CosmicAppList {
+                         parent: parent_window_id,
+                         id: new_id,
+                         dock_item: toplevel_group.clone(),
+-                        popup_type: PopupType::ToplevelList,
++                        popup_type: if toplevel_group.toplevels.is_empty() {
++                            PopupType::HoverName
++                        } else {
++                            PopupType::ToplevelList
++                        },
+                     });
+                     let popup_task =
+                         cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+@@ -1015,6 +1272,7 @@ impl cosmic::Application for CosmicAppList {
+                                     width,
+                                     height,
+                                 } = rectangle;
++                                popup_settings.grab = !via_hover;
+                                 popup_settings.positioner.anchor_rect = iced::Rectangle::<i32> {
+                                     x: x as i32,
+                                     y: y as i32,
+@@ -1023,7 +1281,11 @@ impl cosmic::Application for CosmicAppList {
+                                 };
+                                 let max_windows = 7.0;
+                                 let window_spacing = 8.0;
+-                                popup_settings.positioner.size_limits = match app.core.applet.anchor
++                                let is_name = matches!(
++                                    app.popup.as_ref().map(|p| &p.popup_type),
++                                    Some(PopupType::HoverName)
++                                );
++                                let base_limits = match app.core.applet.anchor
+                                 {
+                                     PanelAnchor::Right | PanelAnchor::Left => Limits::NONE
+                                         .min_width(100.0)
+@@ -1042,6 +1304,11 @@ impl cosmic::Application for CosmicAppList {
+                                         )
+                                         .max_height(window_spacing * 2.0 + TOPLEVEL_BUTTON_HEIGHT),
+                                 };
++                                popup_settings.positioner.size_limits = if is_name {
++                                    Limits::NONE.min_width(1.).min_height(1.).max_width(400.).max_height(60.)
++                                } else {
++                                    base_limits
++                                };
+                                 popup_settings
+                             },
+                             None,
+@@ -1806,13 +2073,12 @@ impl cosmic::Application for CosmicAppList {
+                     .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+                     .any(|y| focused_item.contains(&y.0.foreign_toplevel));
+ 
+-                self.core
+-                    .applet
+-                    .applet_tooltip::<Message>(
+-                        dock_item.as_icon(
++                self.maybe_tooltip(
++                    dock_item,
++                    dock_item.as_icon(
+                             &self.core.applet,
+                             self.rectangle_tracker.as_ref(),
+-                            self.popup.is_none(),
++                            self.popup.is_none() || self.hover_popup,
+                             self.config.enable_drag_source,
+                             self.gpus.as_deref(),
+                             filtered_is_focused,
+@@ -1826,7 +2092,6 @@ impl cosmic::Application for CosmicAppList {
+                             .unwrap_or_default()
+                             .into_owned(),
+                         self.popup.is_some(),
+-                        Message::Surface,
+                         None,
+                     )
+                     .into()
+@@ -1919,13 +2184,12 @@ impl cosmic::Application for CosmicAppList {
+                         .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+                         .any(|y| focused_item.contains(&y.0.foreign_toplevel));
+ 
+-                    self.core
+-                        .applet
+-                        .applet_tooltip(
+-                            dock_item.as_icon(
++                    self.maybe_tooltip(
++                        dock_item,
++                        dock_item.as_icon(
+                                 &self.core.applet,
+                                 self.rectangle_tracker.as_ref(),
+-                                self.popup.is_none(),
++                                self.popup.is_none() || self.hover_popup,
+                                 self.config.enable_drag_source,
+                                 self.gpus.as_deref(),
+                                 filtered_is_focused,
+@@ -1938,8 +2202,8 @@ impl cosmic::Application for CosmicAppList {
+                                 .full_name(&self.locales)
+                                 .unwrap_or_default()
+                                 .into_owned(),
+-                            self.popup.is_some(),
+-                            Message::Surface,
++                            self.popup.is_some()
++                                || (self.config.hover_preview && !dock_item.toplevels.is_empty()),
+                             None,
+                         )
+                         .into()
+@@ -2253,6 +2517,19 @@ impl cosmic::Application for CosmicAppList {
+                         )
+                         .into()
+                 }
++                PopupType::HoverName => {
++                    use cosmic::{cosmic_theme::Layer, widget::autosize::autosize, widget::layer_container};
++                    static HOVER_NAME_ID: std::sync::LazyLock<cosmic::widget::Id> =
++                        std::sync::LazyLock::new(|| cosmic::widget::Id::new("app-list-hover-name"));
++                    let name = desktop_info.full_name(&self.locales).unwrap_or_default().into_owned();
++                    autosize(
++                        layer_container(cosmic::widget::text(name))
++                            .layer(Layer::Background)
++                            .padding(4.),
++                        HOVER_NAME_ID.clone(),
++                    )
++                    .into()
++                }
+                 PopupType::ToplevelList => match self.core.applet.anchor {
+                     PanelAnchor::Left | PanelAnchor::Right => {
+                         let mut content =
+@@ -2328,13 +2605,12 @@ impl cosmic::Application for CosmicAppList {
+                         .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+                         .any(|y| focused_item.contains(&y.0.foreign_toplevel));
+ 
+-                    self.core
+-                        .applet
+-                        .applet_tooltip(
+-                            dock_item.as_icon(
++                    self.maybe_tooltip(
++                        dock_item,
++                        dock_item.as_icon(
+                                 &self.core.applet,
+                                 self.rectangle_tracker.as_ref(),
+-                                self.popup.is_none(),
++                                self.popup.is_none() || self.hover_popup,
+                                 self.config.enable_drag_source,
+                                 self.gpus.as_deref(),
+                                 filtered_is_focused,
+@@ -2347,8 +2623,8 @@ impl cosmic::Application for CosmicAppList {
+                                 .full_name(&self.locales)
+                                 .unwrap_or_default()
+                                 .into_owned(),
+-                            self.popup.is_some(),
+-                            Message::Surface,
++                            self.popup.is_some()
++                                || (self.config.hover_preview && !dock_item.toplevels.is_empty()),
+                             Some(id),
+                         )
+                         .into()
+@@ -2375,6 +2651,8 @@ impl cosmic::Application for CosmicAppList {
+                 mouse_area(content)
+                     .on_release(Message::ClosePopup)
+                     .on_right_release(Message::ClosePopup)
++                    .on_enter(Message::HoverPopupEnter)
++                    .on_exit(Message::HoverPopupExit)
+                     .into()
+             } else {
+                 content.into()
+@@ -2436,13 +2714,12 @@ impl cosmic::Application for CosmicAppList {
+                         .filter(|(info, _)| self.is_on_current_monitor_and_workspace(info))
+                         .any(|y| focused_item.contains(&y.0.foreign_toplevel));
+ 
+-                    self.core
+-                        .applet
+-                        .applet_tooltip(
+-                            dock_item.as_icon(
++                    self.maybe_tooltip(
++                        dock_item,
++                        dock_item.as_icon(
+                                 &self.core.applet,
+                                 self.rectangle_tracker.as_ref(),
+-                                self.popup.is_none(),
++                                self.popup.is_none() || self.hover_popup,
+                                 self.config.enable_drag_source,
+                                 self.gpus.as_deref(),
+                                 filtered_is_focused,
+@@ -2455,8 +2732,8 @@ impl cosmic::Application for CosmicAppList {
+                                 .full_name(&self.locales)
+                                 .unwrap_or_default()
+                                 .to_string(),
+-                            self.popup.is_some(),
+-                            Message::Surface,
++                            self.popup.is_some()
++                                || (self.config.hover_preview && !dock_item.toplevels.is_empty()),
+                             Some(id),
+                         )
+                         .into()
+@@ -2519,6 +2796,12 @@ impl cosmic::Application for CosmicAppList {
+                 cosmic::iced::core::Event::Mouse(
+                     cosmic::iced::core::mouse::Event::ButtonPressed(_),
+                 ) => Some(Message::Pressed(id)),
++                cosmic::iced::core::Event::Mouse(
++                    cosmic::iced::core::mouse::Event::CursorMoved { position },
++                ) => Some(Message::CursorMoved(id, position)),
++                cosmic::iced::core::Event::Mouse(cosmic::iced::core::mouse::Event::CursorLeft) => {
++                    Some(Message::CursorLeft(id))
++                }
+                 _ => None,
+             }),
+             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
